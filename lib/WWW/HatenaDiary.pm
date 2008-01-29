@@ -5,11 +5,10 @@ use Carp;
 use URI;
 use Web::Scraper;
 use WWW::Mechanize;
+use WWW::HatenaLogin;
 use JSON::Syck 'Load';
 
-our $VERSION = '0.01';
-
-my $login_uri = 'https://www.hatena.ne.jp/login';
+our $VERSION = '0.02';
 
 sub new {
     my ($class, $args) = @_;
@@ -18,11 +17,7 @@ sub new {
     my $self     = bless {
         base     => $base,
         group    => $args->{group},
-        username => $args->{username},
-        password => $args->{password},
-        mech     => WWW::Mechanize->new(
-            $args->{mech_opt} && ref $args->{mech_opt} ? %{$args->{mech_opt}} : ()
-        ),
+        login    => $args->{login} || WWW::HatenaLogin->new({ nologin => 1, %{ $args } }),
         verbose  => $args->{verbose},
     }, $class;
 
@@ -30,9 +25,9 @@ sub new {
         my $username = scraper {
             process '//td[@class="username"]/a', 'username' => 'TEXT';
             result 'username';
-        }->scrape($self->{mech}->content, URI->new($login_uri));
-        $self->{username} = $username if !$self->{username};
-        $self->{diary}    = "$self->{base}$self->{username}/";
+        }->scrape($self->{login}->mech->content, $self->{login}->login_uri);
+        $self->{login}->username($username) if !$self->{login}->username;
+        $self->{diary}    = $self->{base}.$self->{login}->username.'/';
     }
 
     $self;
@@ -40,34 +35,14 @@ sub new {
 
 sub is_loggedin {
     my $self = shift;
-    my $link;
-
-    $self->{mech}->get($login_uri);
-    ($link) = map { $_->url } $self->{mech}->find_link(tag => 'meta');
-
-    !!$link;
+    $self->{login}->is_loggedin;
 }
 
 sub login {
     my ($self, $args) = @_;
 
-    if ($args) {
-        if ($args->{username}) {
-            $self->{username} = $args->{username};
-        }
-        if ($args->{password}) {
-            $self->{password} = $args->{password};
-        }
-    }
-
-    $self->{diary} = "$self->{base}$self->{username}/";
-    $self->{mech}->get($login_uri);
-    $self->{mech}->submit_form(
-        fields => {
-            name     => $self->{username},
-            password => $self->{password},
-        }
-    );
+    $self->{login}->login($args);
+    $self->{diary} = $self->{base}.$self->{login}->username.'/';
 
     !!($self->{rkm} = $self->get_rkm) ||
         croak 'Login failed. Please confirm your username/password';
@@ -77,9 +52,9 @@ sub get_rkm {
     my $self = shift;
     my $rkm;
 
-    $self->{mech}->get("$self->{diary}?mode=json");
+    $self->{login}->mech->get("$self->{diary}?mode=json");
     eval {
-        $rkm = Load($self->{mech}->content)->{rkm};
+        $rkm = Load($self->{login}->mech->content)->{rkm};
     };
 
     $rkm;
@@ -100,8 +75,8 @@ sub retrieve {
     croak('URI for the entry is required')
         if !$args->{uri};
 
-    $self->{mech}->get("$args->{uri}?mode=json");
-    Load($self->{mech}->content);
+    $self->{login}->mech->get("$args->{uri}?mode=json");
+    Load($self->{login}->mech->content);
 }
 
 sub retrieve_day {
@@ -114,8 +89,8 @@ sub retrieve_day {
         my ($y, $m, $d) = ($1, $2, $3);
 
         my $uri = "$self->{diary}edit?date=$y$m$d";
-        $self->{mech}->get($uri);
-        my $form = $self->{mech}->form_name('edit');
+        $self->{login}->mech->get($uri);
+        my $form = $self->{login}->mech->form_name('edit');
 
         {
             title => $form->value('title'),
@@ -146,8 +121,8 @@ sub update_day {
         my ($y, $m, $d) = ($1, $2, $3);
 
         my $uri = "$self->{diary}edit?date=$y$m$d";
-        $self->{mech}->get($uri);
-        $self->{mech}->submit_form(
+        $self->{login}->mech->get($uri);
+        $self->{login}->mech->submit_form(
             form_name => 'edit',
             fields => {
                 title => $args->{title},
@@ -162,7 +137,7 @@ sub update_day {
         carp "Invalid ymd format: $args->{date}. YYYY-MM-DD formatted date is required.";
     }
 
-    $self->{mech}->success;
+    $self->{login}->mech->success;
 }
 
 # XXX: It's dubious if this implementation is correct...
@@ -205,39 +180,41 @@ sub delete_day {
         my ($y, $m, $d) = ($1, $2, $3);
         my $uri = "$self->{diary}edit?date=$y$m$d";
 
-        $self->{mech}->get($uri);
+        $self->{login}->mech->get($uri);
 
         if ($self->{group}) {
-            for my $form ($self->{mech}->forms) {
+            for my $form ($self->{login}->mech->forms) {
                 if ($form->action =~ /deletediary$/) {
-                    $self->{mech}->request($form->click);
+                    $self->{login}->mech->request($form->click);
                 }
             }
         }
         else {
-            $self->{mech}->submit_form(form_number => 2);
+            $self->{login}->mech->submit_form(form_number => 2);
         }
     }
     else {
         carp "Invalid ymd format: $args->{date}. YYYY-MM-DD formatted date is required.";
     }
 
-    $self->{mech}->success;
+    $self->{login}->mech->success;
 }
 
 sub _post_entry {
     my ($self, $args) = @_;
     my $uri = $args->{uri} || $self->{diary};
 
-    $self->{mech}->post($uri, {
+    $self->{login}->mech->post($uri, {
         rkm => $self->{rkm},
         %$args,
     });
 
+    $self->{login}->mech->get($uri);
+
     scraper {
         process '//div[@class="section"][1]/h3[1]/a[1]', 'uri' => '@href';
         result 'uri';
-    }->scrape(URI->new($uri));
+    }->scrape($self->{login}->mech->content, URI->new($self->{diary}));
 }
 
 1;
@@ -260,6 +237,12 @@ WWW::HatenaDiary - CRUD interface to Hatena::Diary
           timeout    => $timeout,
           cookie_jar => HTTP::Cookies->new(...),
       },
+  });
+
+  # Or just pass a WWW::HatenaLogin object like below if you already have it.
+  # See the POD of it for details
+  my $diary = WWW::HatenaDiary->new({
+      login => $login                 # it's a WWW::HatenaLogin object
   });
 
   # Check if already logged in to Hatena::Diary
@@ -323,13 +306,13 @@ ways.
 This module is, so far, for those who want to write some tools not
 only to retrieve data from diaries, but also to create/update/delete
 the posts at the same time. Which is why I adopted the way as if this
-module treats such API like AtomPP, and this module retrieves and
-returns raw formatted post content not a data already converted to
+module treats such API like AtomPub, and this module retrieves and
+returns a raw formatted post content not a data already converted to
 HTML.
 
 =head1 METHODS
 
-=head2 new ( [I<\%args>] )
+=head2 new ( I<\%args> )
 
 =over 4
 
@@ -343,6 +326,13 @@ HTML.
       },
   });
 
+  # or...
+
+  my $diary = WWW::HatenaDiary->new({
+      login => $login                 # it's a WWW::HatenaLogin object
+  });
+
+
 Creates and returns a new WWW::HatenaDiary object. If you have a valid
 cookie and pass it into this method as one of C<mech_opt>, you can
 omit C<username> and C<password>. Even in that case, you might want to
@@ -352,9 +342,14 @@ C<is_loggedin> method below.
 C<group> field is optional, which will be required if you want to work
 with your diary on Hatena::Group.
 
-C<mech_opt> field is also optional. You can use it to customize the
+C<mech_opt> field is optional. You can use it to customize the
 behavior of this module in the way you like. See the POD of
 L<WWW::Mechanize> for more details.
+
+C<login> field is also optional. If you already have a
+L<WWW::HatenaLogin> object, you can use it to communicate with
+Hatena::Diary after just passing it as the value of the field. See the
+POD of L<WWW::HatenaLogin> for more details.
 
 =back
 
@@ -366,7 +361,7 @@ L<WWW::Mechanize> for more details.
       ...
   }
 
-Checks if C<$diary> object already logs in Hatena::Diary.
+Checks if C<$diary> object already logs in to Hatena::Diary.
 
 =back
 
@@ -380,8 +375,8 @@ Checks if C<$diary> object already logs in Hatena::Diary.
   });
 
 Logs in to Hatena::Diary using C<username> and C<password>. If either
-C<username> or C<password> isn't passed into this method, the value
-which is passed into C<new> method above.
+C<username> or C<password> isn't passed into this method, the values
+which are passed into C<new> method above will be used.
 
 =back
 
@@ -534,13 +529,17 @@ Deletes whole the posts of the C<date>.
 
 L<http://d.hatena.ne.jp/>
 
+=item * L<WWW::HatenaLogin>
+
 =item * L<WWW::Mechanize>
 
 =back
 
 =head1 ACKNOWLEDGMENT
 
-typester++ for some codes copied from Fuse::Hatena.
+typester++ for some codes copied from L<Fuse::Hatena>.
+
+Yappo++ for improving this module using L<WWW::HatenaLogin>
 
 =head1 AUTHOR
 

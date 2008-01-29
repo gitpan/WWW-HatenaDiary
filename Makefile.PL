@@ -9,6 +9,8 @@ requires $_ for (qw/
     JSON::Syck
 /);
 
+requires WWW::HatenaLogin => 0.02;
+
 build_requires 'Test::More';
 use_test_base;
 auto_include;
